@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhotoBoard - Photo & Video Upload</title>
+    <link rel="stylesheet" href="styles.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+
+<body>
+
+    <div id="ui-layer">
+        <!-- Mode Buttons -->
+        <div class="ui-section">
+            <button class="btn-mode active" onclick="setMode('user')" id="btn-user">User Mode</button>
+            <button class="btn-mode" onclick="setMode('admin')" id="btn-admin">Admin Mode</button>
+        </div>
+
+        <div class="ui-divider"></div>
+
+        <!-- Admin Controls (hidden in user mode) -->
+        <div class="ui-section" id="admin-controls" style="display: none;">
+            <label for="area-count">Areas:</label>
+            <input type="number" id="area-count" value="6" min="1" max="12">
+            <button class="btn-primary"
+                onclick="createAreas(parseInt(document.getElementById('area-count').value))">Create Areas</button>
+            <button class="btn-danger" onclick="resetAreas()">Reset</button>
+            <button class="btn-download" onclick="downloadAllMedia()">⬇️ Download All</button>
+        </div>
+
+        <span id="status-text">Click on your designated area to upload a photo or video.</span>
+    </div>
+
+    <div id="board">
+        <div id="area-container">
+            <!-- Areas will be generated here -->
+        </div>
+    </div>
+
+    <div id="fullscreen-modal">
+        <img id="fullscreen-img" src="" alt="Fullscreen View">
+        <video id="fullscreen-video" src="" controls></video>
+    </div>
+
+    <input type="file" id="file-input" accept="image/*,video/*">
+
+    <script src="app.js"></script>
+</body>
+
+</html>
