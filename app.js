@@ -1,94 +1,30 @@
-// PhotoBoard - Area-Based Layout
-// app.js
+// PhotoBoard - Real-time Photo & Video Sharing
+// Using Firebase Firestore (sync) + Cloudinary (media storage)
+
+// ============ Firebase Configuration ============
+const firebaseConfig = {
+    apiKey: "AIzaSyDI63JhQvBXsWsC_fjGU0F16ufEZqBPXFM",
+    authDomain: "photoboard-c279b.firebaseapp.com",
+    projectId: "photoboard-c279b",
+    storageBucket: "photoboard-c279b.firebasestorage.app",
+    messagingSenderId: "623858429917",
+    appId: "1:623858429917:web:ac7104ed61b135e4019034"
+};
+
+// ============ Cloudinary Configuration ============
+const CLOUDINARY_CLOUD_NAME = 'dwq1io4it';
+const CLOUDINARY_UPLOAD_PRESET = 'onkcbsyc';
+const CLOUDINARY_UPLOAD_URL = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`;
+
+// Initialize Firebase
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
 
 // ============ State ============
-let currentMode = 'user'; // 'user' or 'admin'
+let currentMode = 'user';
 let areas = [];
 let activeArea = null;
-let db = null; // IndexedDB instance
-
-// ============ IndexedDB ============
-const DB_NAME = 'PhotoBoardDB';
-const DB_VERSION = 1;
-const STORE_NAME = 'state';
-
-function openDatabase() {
-    return new Promise((resolve, reject) => {
-        if (!window.indexedDB) {
-            console.warn('IndexedDB not supported, using localStorage');
-            resolve(null);
-            return;
-        }
-
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-
-        request.onerror = () => {
-            console.warn('IndexedDB error, falling back to localStorage');
-            resolve(null);
-        };
-
-        request.onsuccess = (e) => {
-            resolve(e.target.result);
-        };
-
-        request.onupgradeneeded = (e) => {
-            const database = e.target.result;
-            if (!database.objectStoreNames.contains(STORE_NAME)) {
-                database.createObjectStore(STORE_NAME, { keyPath: 'id' });
-            }
-        };
-    });
-}
-
-async function saveToIndexedDB(data) {
-    if (!db) {
-        localStorage.setItem('photoboard-state', JSON.stringify(data));
-        return;
-    }
-
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readwrite');
-        const store = tx.objectStore(STORE_NAME);
-        store.put({ id: 'state', ...data });
-        tx.oncomplete = () => resolve();
-        tx.onerror = () => {
-            localStorage.setItem('photoboard-state', JSON.stringify(data));
-            resolve();
-        };
-    });
-}
-
-async function loadFromIndexedDB() {
-    if (!db) {
-        const saved = localStorage.getItem('photoboard-state');
-        return saved ? JSON.parse(saved) : null;
-    }
-
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, 'readonly');
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.get('state');
-
-        request.onsuccess = () => {
-            if (request.result) {
-                resolve(request.result);
-            } else {
-                // Try localStorage for migration
-                const saved = localStorage.getItem('photoboard-state');
-                if (saved) {
-                    resolve(JSON.parse(saved));
-                } else {
-                    resolve(null);
-                }
-            }
-        };
-
-        request.onerror = () => {
-            const saved = localStorage.getItem('photoboard-state');
-            resolve(saved ? JSON.parse(saved) : null);
-        };
-    });
-}
+let unsubscribe = null;
 
 // ============ DOM Elements ============
 const board = document.getElementById('board');
@@ -97,21 +33,44 @@ const fileInput = document.getElementById('file-input');
 const statusText = document.getElementById('status-text');
 const fullscreenModal = document.getElementById('fullscreen-modal');
 const fullscreenImg = document.getElementById('fullscreen-img');
+const fullscreenVideo = document.getElementById('fullscreen-video');
 const areaCountInput = document.getElementById('area-count');
+const syncStatus = document.getElementById('sync-status');
+const uploadModal = document.getElementById('upload-modal');
+const uploadStatus = document.getElementById('upload-status');
+const uploadProgress = document.getElementById('upload-progress');
+
+// ============ Sync Status ============
+function setSyncStatus(status, message) {
+    syncStatus.className = 'sync-indicator ' + status;
+    syncStatus.textContent = message;
+}
+
+// ============ Upload Modal ============
+function showUploadModal(message = 'Uploading...') {
+    uploadStatus.textContent = message;
+    uploadProgress.style.width = '0%';
+    uploadModal.classList.add('active');
+}
+
+function updateUploadProgress(percent) {
+    uploadProgress.style.width = percent + '%';
+}
+
+function hideUploadModal() {
+    uploadModal.classList.remove('active');
+}
 
 // ============ Mode Switching ============
 function setMode(mode) {
     currentMode = mode;
-
     document.getElementById('btn-user').classList.toggle('active', mode === 'user');
     document.getElementById('btn-admin').classList.toggle('active', mode === 'admin');
 
-    // Show/hide admin controls
     const adminControls = document.getElementById('admin-controls');
     if (adminControls) {
         adminControls.style.display = mode === 'admin' ? 'flex' : 'none';
     }
-
     updateStatus();
 }
 
@@ -127,29 +86,70 @@ function updateStatus() {
     }
 }
 
+// ============ Cloudinary Upload ============
+async function uploadToCloudinary(file, areaId) {
+    return new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+        formData.append('folder', 'photoboard');
+        formData.append('public_id', `area_${areaId}_${Date.now()}`);
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', CLOUDINARY_UPLOAD_URL);
+
+        xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+                const percent = (e.loaded / e.total) * 100;
+                updateUploadProgress(percent);
+            }
+        };
+
+        xhr.onload = () => {
+            if (xhr.status === 200) {
+                const response = JSON.parse(xhr.responseText);
+                resolve({
+                    url: response.secure_url,
+                    publicId: response.public_id,
+                    resourceType: response.resource_type
+                });
+            } else {
+                reject(new Error('Upload failed'));
+            }
+        };
+
+        xhr.onerror = () => reject(new Error('Upload failed'));
+        xhr.send(formData);
+    });
+}
+
 // ============ Area Management ============
-function createAreas(count) {
-    // Clear existing areas
+async function createAreas(count) {
     areaContainer.innerHTML = '';
     areas = [];
-
-    // Set grid class based on count
     areaContainer.className = `grid-${Math.min(count, 9)}`;
 
+    const areasData = [];
     for (let i = 0; i < count; i++) {
-        const area = createAreaElement(i + 1, `Area ${i + 1}`);
-        areaContainer.appendChild(area);
-        areas.push({
+        areasData.push({
             id: i + 1,
             name: `Area ${i + 1}`,
-            element: area,
-            mediaSrc: null,
-            mediaType: null
+            mediaUrl: null,
+            mediaType: null,
+            publicId: null
         });
     }
 
-    updateStatus();
-    saveState();
+    try {
+        await db.collection('photoboard').doc('state').set({
+            areas: areasData,
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        setSyncStatus('connected', '✅ Synced');
+    } catch (error) {
+        console.error('Error saving to Firebase:', error);
+        setSyncStatus('error', '❌ Sync failed');
+    }
 }
 
 function createAreaElement(id, name) {
@@ -157,12 +157,10 @@ function createAreaElement(id, name) {
     area.className = 'area';
     area.dataset.id = id;
 
-    // Label
     const label = document.createElement('div');
     label.className = 'area-label';
     label.textContent = name;
 
-    // Double-click to edit in admin mode
     label.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         if (currentMode === 'admin') {
@@ -170,7 +168,6 @@ function createAreaElement(id, name) {
         }
     });
 
-    // Placeholder
     const placeholder = document.createElement('div');
     placeholder.className = 'area-placeholder';
     placeholder.innerHTML = `
@@ -181,25 +178,20 @@ function createAreaElement(id, name) {
     area.appendChild(label);
     area.appendChild(placeholder);
 
-    // Click handler
     area.addEventListener('click', (e) => {
-        if (e.target.tagName === 'INPUT') return; // Don't trigger on label input
+        if (e.target.tagName === 'INPUT') return;
         handleAreaClick(id);
     });
 
-    // Drag & Drop handlers
+    // Drag & Drop
     area.addEventListener('dragenter', (e) => {
         e.preventDefault();
-        if (currentMode === 'user') {
-            area.classList.add('drag-over');
-        }
+        if (currentMode === 'user') area.classList.add('drag-over');
     });
 
     area.addEventListener('dragover', (e) => {
         e.preventDefault();
-        if (currentMode === 'user') {
-            area.classList.add('drag-over');
-        }
+        if (currentMode === 'user') area.classList.add('drag-over');
     });
 
     area.addEventListener('dragleave', (e) => {
@@ -210,9 +202,7 @@ function createAreaElement(id, name) {
     area.addEventListener('drop', (e) => {
         e.preventDefault();
         area.classList.remove('drag-over');
-        if (currentMode === 'user') {
-            handleDrop(id, e);
-        }
+        if (currentMode === 'user') handleDrop(id, e);
     });
 
     return area;
@@ -227,9 +217,7 @@ function enableLabelEdit(labelElement, areaId) {
     input.value = currentName;
     input.addEventListener('blur', () => finishLabelEdit(labelElement, input, areaId));
     input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-            input.blur();
-        }
+        if (e.key === 'Enter') input.blur();
     });
 
     labelElement.appendChild(input);
@@ -237,71 +225,73 @@ function enableLabelEdit(labelElement, areaId) {
     input.select();
 }
 
-function finishLabelEdit(labelElement, input, areaId) {
+async function finishLabelEdit(labelElement, input, areaId) {
     const newName = input.value.trim() || `Area ${areaId}`;
     labelElement.textContent = newName;
 
-    // Update state
     const areaData = areas.find(a => a.id === areaId);
-    if (areaData) {
-        areaData.name = newName;
-    }
+    if (areaData) areaData.name = newName;
 
-    saveState();
+    await saveToFirebase();
 }
 
 function handleAreaClick(areaId) {
     if (currentMode === 'user') {
         activeArea = areaId;
         fileInput.click();
-    } else {
-        // In admin mode, clicking does nothing (use double-click to rename)
     }
 }
 
-function setAreaMedia(areaId, mediaSrc, mediaType) {
+function renderAreaMedia(areaId, mediaUrl, mediaType) {
     const areaData = areas.find(a => a.id === areaId);
-    if (!areaData) return;
+    if (!areaData || !areaData.element) return;
 
     const areaElement = areaData.element;
-    areaData.mediaSrc = mediaSrc;
-    areaData.mediaType = mediaType;
 
-    // Remove placeholder if exists
+    // Remove existing content
     const placeholder = areaElement.querySelector('.area-placeholder');
-    if (placeholder) {
-        placeholder.remove();
-    }
-
-    // Remove existing media if any
     const existingImg = areaElement.querySelector('img');
     const existingVideo = areaElement.querySelector('video');
+    const existingDeleteBtn = areaElement.querySelector('.area-delete-btn');
+
+    if (placeholder) placeholder.remove();
     if (existingImg) existingImg.remove();
     if (existingVideo) existingVideo.remove();
+    if (existingDeleteBtn) existingDeleteBtn.remove();
 
-    // Add new media
+    if (!mediaUrl) {
+        const newPlaceholder = document.createElement('div');
+        newPlaceholder.className = 'area-placeholder';
+        newPlaceholder.innerHTML = `
+            <div class="area-placeholder-icon">📷🎬</div>
+            <div class="area-placeholder-text">Click to upload</div>
+        `;
+        areaElement.appendChild(newPlaceholder);
+        areaElement.classList.remove('has-image');
+        return;
+    }
+
     let mediaElement;
     if (mediaType === 'video') {
         mediaElement = document.createElement('video');
-        mediaElement.src = mediaSrc;
+        mediaElement.src = mediaUrl;
         mediaElement.muted = true;
         mediaElement.loop = true;
         mediaElement.autoplay = true;
         mediaElement.playsInline = true;
         mediaElement.addEventListener('click', (e) => {
             e.stopPropagation();
-            openFullscreen(mediaSrc, 'video');
+            openFullscreen(mediaUrl, 'video');
         });
     } else {
         mediaElement = document.createElement('img');
-        mediaElement.src = mediaSrc;
+        mediaElement.src = mediaUrl;
         mediaElement.addEventListener('click', (e) => {
             e.stopPropagation();
-            openFullscreen(mediaSrc, 'image');
+            openFullscreen(mediaUrl, 'image');
         });
     }
 
-    // Add delete button
     const deleteBtn = document.createElement('button');
     deleteBtn.className = 'area-delete-btn';
     deleteBtn.innerHTML = '×';
@@ -314,16 +304,12 @@ function setAreaMedia(areaId, mediaSrc, mediaType) {
     areaElement.appendChild(mediaElement);
     areaElement.appendChild(deleteBtn);
     areaElement.classList.add('has-image');
-
-    saveState();
 }
 
-function resetAreas() {
+async function resetAreas() {
     if (confirm('Are you sure you want to reset all areas? This will remove all media.')) {
-        areaContainer.innerHTML = '';
-        areas = [];
+        await db.collection('photoboard').doc('state').delete();
 
-        // Show empty state
         areaContainer.innerHTML = `
             <div id="empty-state">
                 <h2>No Areas Created</h2>
@@ -331,46 +317,34 @@ function resetAreas() {
             </div>
         `;
         areaContainer.className = '';
-
-        localStorage.removeItem('photoboard-state');
+        areas = [];
         updateStatus();
     }
 }
 
-function deleteAreaMedia(areaId) {
+async function deleteAreaMedia(areaId) {
     if (!confirm('Delete this media?')) return;
 
     const areaData = areas.find(a => a.id === areaId);
     if (!areaData) return;
 
-    const areaElement = areaData.element;
-    areaData.mediaSrc = null;
-    areaData.mediaType = null;
+    showUploadModal('Deleting...');
 
-    // Remove media and delete button
-    const img = areaElement.querySelector('img');
-    const video = areaElement.querySelector('video');
-    const deleteBtn = areaElement.querySelector('.area-delete-btn');
-    if (img) img.remove();
-    if (video) video.remove();
-    if (deleteBtn) deleteBtn.remove();
+    try {
+        areaData.mediaUrl = null;
+        areaData.mediaType = null;
+        areaData.publicId = null;
 
-    // Restore placeholder
-    const placeholder = document.createElement('div');
-    placeholder.className = 'area-placeholder';
-    placeholder.innerHTML = `
-        <div class="area-placeholder-icon">📷🎬</div>
-        <div class="area-placeholder-text">Click to upload</div>
-    `;
-    areaElement.appendChild(placeholder);
-    areaElement.classList.remove('has-image');
-
-    saveState();
+        await saveToFirebase();
+        hideUploadModal();
+    } catch (error) {
+        console.error('Error deleting:', error);
+        hideUploadModal();
+        alert('Failed to delete. Please try again.');
+    }
 }
 
 // ============ Fullscreen ============
-const fullscreenVideo = document.getElementById('fullscreen-video');
-
 function openFullscreen(src, type = 'image') {
     if (type === 'video') {
         fullscreenImg.style.display = 'none';
@@ -396,58 +370,86 @@ function closeFullscreen() {
 
 // ============ Download All ============
 async function downloadAllMedia() {
-    const mediaWithData = areas.filter(a => a.mediaSrc);
+    const mediaWithData = areas.filter(a => a.mediaUrl);
 
     if (mediaWithData.length === 0) {
         alert('No media to download. Upload some photos or videos first!');
         return;
     }
 
-    const zip = new JSZip();
+    showUploadModal('Preparing download...');
 
-    mediaWithData.forEach((areaData, index) => {
-        // Extract base64 data and file extension
-        const base64Data = areaData.mediaSrc.split(',')[1];
-        const mimeType = areaData.mediaSrc.split(';')[0].split(':')[1];
-        let extension = mimeType.split('/')[1] || 'png';
-        // Handle special video extensions
-        if (extension === 'quicktime') extension = 'mov';
-        if (extension === 'x-matroska') extension = 'mkv';
+    try {
+        const zip = new JSZip();
 
-        // Create safe filename from area name
-        const safeName = areaData.name.replace(/[^a-zA-Z0-9]/g, '_');
-        const filename = `${safeName}.${extension}`;
+        for (let i = 0; i < mediaWithData.length; i++) {
+            const areaData = mediaWithData[i];
+            updateUploadProgress((i / mediaWithData.length) * 100);
+            uploadStatus.textContent = `Downloading ${i + 1}/${mediaWithData.length}...`;
 
-        zip.file(filename, base64Data, { base64: true });
-    });
+            const response = await fetch(areaData.mediaUrl);
+            const blob = await response.blob();
 
-    // Generate and download ZIP
-    const content = await zip.generateAsync({ type: 'blob' });
-    const url = URL.createObjectURL(content);
+            const mimeType = blob.type;
+            let extension = mimeType.split('/')[1] || 'bin';
+            if (extension === 'quicktime') extension = 'mov';
 
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `PhotoBoard_${new Date().toISOString().slice(0, 10)}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+            const safeName = areaData.name.replace(/[^a-zA-Z0-9]/g, '_');
+            const filename = `${safeName}.${extension}`;
+
+            zip.file(filename, blob);
+        }
+
+        updateUploadProgress(100);
+        uploadStatus.textContent = 'Creating ZIP...';
+
+        const content = await zip.generateAsync({ type: 'blob' });
+        const url = URL.createObjectURL(content);
+
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `PhotoBoard_${new Date().toISOString().slice(0, 10)}.zip`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        hideUploadModal();
+    } catch (error) {
+        console.error('Error downloading:', error);
+        hideUploadModal();
+        alert('Failed to download. Please try again.');
+    }
 }
 
 // ============ File Upload ============
-fileInput.addEventListener('change', (e) => {
+fileInput.addEventListener('change', async (e) => {
     if (fileInput.files && fileInput.files[0] && activeArea !== null) {
         const file = fileInput.files[0];
-        const reader = new FileReader();
         const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
 
-        reader.onload = function (e) {
-            setAreaMedia(activeArea, e.target.result, mediaType);
+        showUploadModal('Uploading to cloud...');
+
+        try {
+            const result = await uploadToCloudinary(file, activeArea);
+
+            const areaData = areas.find(a => a.id === activeArea);
+            if (areaData) {
+                areaData.mediaUrl = result.url;
+                areaData.mediaType = mediaType;
+                areaData.publicId = result.publicId;
+            }
+
+            await saveToFirebase();
+
             activeArea = null;
             fileInput.value = '';
-        };
-
-        reader.readAsDataURL(file);
+            hideUploadModal();
+        } catch (error) {
+            console.error('Upload error:', error);
+            hideUploadModal();
+            alert('Upload failed. Please try again.');
+        }
     }
 });
 
@@ -456,118 +458,145 @@ function handleDrop(areaId, e) {
     if (files && files.length > 0) {
         const file = files[0];
 
-        // Validate file type (image or video)
         if (!file.type.startsWith('image/') && !file.type.startsWith('video/')) {
             alert('Please drop an image or video file.');
             return;
         }
 
-        const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
-        const reader = new FileReader();
-        reader.onload = function (e) {
-            setAreaMedia(areaId, e.target.result, mediaType);
-        };
-        reader.readAsDataURL(file);
+        activeArea = areaId;
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(file);
+        fileInput.files = dataTransfer.files;
+        fileInput.dispatchEvent(new Event('change'));
     }
 }
 
-// ============ Persistence ============
-function saveState() {
-    const state = {
-        areas: areas.map(a => ({
+// ============ Firebase Sync ============
+async function saveToFirebase() {
+    try {
+        const areasData = areas.map(a => ({
             id: a.id,
             name: a.name,
-            mediaSrc: a.mediaSrc,
-            mediaType: a.mediaType
-        }))
-    };
-    saveToIndexedDB(state);
+            mediaUrl: a.mediaUrl || null,
+            mediaType: a.mediaType || null,
+            publicId: a.publicId || null
+        }));
+
+        await db.collection('photoboard').doc('state').set({
+            areas: areasData,
+            updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+
+        setSyncStatus('connected', '✅ Synced');
+    } catch (error) {
+        console.error('Error saving to Firebase:', error);
+        setSyncStatus('error', '❌ Sync failed');
+    }
 }
 
-async function loadState() {
-    const state = await loadFromIndexedDB();
+function subscribeToUpdates() {
+    unsubscribe = db.collection('photoboard').doc('state')
+        .onSnapshot((doc) => {
+            if (doc.exists) {
+                const data = doc.data();
+                renderAreas(data.areas);
+                setSyncStatus('connected', '✅ Live');
+            } else {
+                areaContainer.innerHTML = `
+                    <div id="empty-state">
+                        <h2>No Areas Created</h2>
+                        <p>Switch to Admin Mode to create areas.</p>
+                    </div>
+                `;
+                areaContainer.className = '';
+                areas = [];
+            }
+            updateStatus();
+        }, (error) => {
+            console.error('Firestore error:', error);
+            setSyncStatus('error', '❌ Connection lost');
+        });
+}
 
-    if (!state || !state.areas || state.areas.length === 0) {
-        // Show empty state
+function renderAreas(areasData) {
+    if (!areasData || areasData.length === 0) {
         areaContainer.innerHTML = `
             <div id="empty-state">
                 <h2>No Areas Created</h2>
                 <p>Switch to Admin Mode to create areas.</p>
             </div>
         `;
+        areaContainer.className = '';
+        areas = [];
         return;
     }
 
-    try {
-        // Recreate areas
-        areaContainer.innerHTML = '';
-        areaContainer.className = `grid-${Math.min(state.areas.length, 9)}`;
+    const needsRebuild = areas.length !== areasData.length;
 
-        state.areas.forEach(areaData => {
+    if (needsRebuild) {
+        areaContainer.innerHTML = '';
+        areaContainer.className = `grid-${Math.min(areasData.length, 9)}`;
+        areas = [];
+
+        areasData.forEach(areaData => {
             const area = createAreaElement(areaData.id, areaData.name);
             areaContainer.appendChild(area);
-
-            // Handle migration from old imageSrc to new mediaSrc
-            const mediaSrc = areaData.mediaSrc || areaData.imageSrc;
-            const mediaType = areaData.mediaType || (mediaSrc && mediaSrc.startsWith('data:video') ? 'video' : 'image');
 
             areas.push({
                 id: areaData.id,
                 name: areaData.name,
                 element: area,
-                mediaSrc: mediaSrc,
-                mediaType: mediaType
+                mediaUrl: areaData.mediaUrl,
+                mediaType: areaData.mediaType,
+                publicId: areaData.publicId
             });
 
-            // Restore media if any
-            if (mediaSrc) {
-                // Small delay to let DOM settle
-                setTimeout(() => {
-                    setAreaMedia(areaData.id, mediaSrc, mediaType);
-                }, 50);
+            if (areaData.mediaUrl) {
+                renderAreaMedia(areaData.id, areaData.mediaUrl, areaData.mediaType);
             }
         });
+    } else {
+        areasData.forEach(areaData => {
+            const existing = areas.find(a => a.id === areaData.id);
+            if (existing) {
+                if (existing.name !== areaData.name) {
+                    existing.name = areaData.name;
+                    const label = existing.element.querySelector('.area-label');
+                    if (label) label.textContent = areaData.name;
+                }
 
-        // Update area count input
-        if (areaCountInput) {
-            areaCountInput.value = state.areas.length;
-        }
+                if (existing.mediaUrl !== areaData.mediaUrl) {
+                    existing.mediaUrl = areaData.mediaUrl;
+                    existing.mediaType = areaData.mediaType;
+                    existing.publicId = areaData.publicId;
+                    renderAreaMedia(areaData.id, areaData.mediaUrl, areaData.mediaType);
+                }
+            }
+        });
+    }
 
-        // Migrate from localStorage to IndexedDB (one-time)
-        if (db && localStorage.getItem('photoboard-state')) {
-            await saveToIndexedDB(state);
-            localStorage.removeItem('photoboard-state');
-            console.log('Migrated data from localStorage to IndexedDB');
-        }
-    } catch (e) {
-        console.error('Failed to load state:', e);
+    if (areaCountInput) {
+        areaCountInput.value = areasData.length;
     }
 }
 
 // ============ Initialize ============
 async function init() {
-    // Initialize IndexedDB
-    db = await openDatabase();
-
+    setSyncStatus('', '🔄 Connecting...');
     setMode('user');
-    await loadState();
-    updateStatus();
+    subscribeToUpdates();
 
-    // Close fullscreen on click (only on background, not on video controls)
     fullscreenModal.addEventListener('click', (e) => {
-        // Only close if clicking directly on the modal background
         if (e.target === fullscreenModal || e.target === fullscreenImg) {
             closeFullscreen();
         }
     });
 
-    // Prevent video clicks from closing modal
     fullscreenVideo.addEventListener('click', (e) => {
         e.stopPropagation();
     });
 }
 
-// Run init when DOM is ready
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
 } else {
